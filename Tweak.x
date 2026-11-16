@@ -1,5 +1,5 @@
 // ============================================================
-//  VisibleIsland  2.11.0  (汉化版)
+//  VisibleIsland  2.11.1  (汉化版)
 //  原版：https://github.com/ethxnn88/VisibleIsland
 //
 //  基线 = 2.9.0（实测能正常显示的最后一版），
@@ -38,8 +38,6 @@
 #define VI_PREF_DOMAIN     @"com.ethxnn88.visibleislandprefs"
 #define VI_NOTIFY_UPDATE   CFSTR("com.ethxnn88.visibleislandprefs-updated")
 #define VI_NOTIFY_RESPRING CFSTR("com.ethxnn88.visibleislandprefs-respring")
-#define VI_NOTIFY_DUMP     CFSTR("com.ethxnn88.visibleislandprefs-dump")
-#define VI_DUMP_PATH       @"/var/mobile/visibleisland_geom.txt"
 
 // ---------------- 全局状态 ----------------
 
@@ -228,120 +226,6 @@ static void VISyncIdleVisibility(void) {
 
 // ---------------- 几何导出（诊断用，手动触发） ----------------
 
-static void VIDumpView(UIView *v, int depth, NSMutableString *out) {
-    if (!v || depth > 7) return;
-    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2)
-                                      withString:@" "
-                                   startingAtIndex:0];
-    [out appendFormat:@"%@%@ f=%@ b=%@ hid=%d a=%.2f t=%@\n",
-                      pad,
-                      NSStringFromClass([v class]),
-                      NSStringFromCGRect(v.frame),
-                      NSStringFromCGRect(v.bounds),
-                      (int)v.hidden,
-                      (double)v.alpha,
-                      CGAffineTransformIsIdentity(v.transform) ? @"id" : NSStringFromCGAffineTransform(v.transform)];
-    for (UIView *sub in v.subviews) {
-        VIDumpView(sub, depth + 1, out);
-    }
-}
-
-static void VIDumpMethods(NSString *cls, NSMutableString *out) {
-    Class c = NSClassFromString(cls);
-    if (!c) {
-        [out appendFormat:@"\n[class %@] 不存在\n", cls];
-        return;
-    }
-    [out appendFormat:@"\n[class %@]\n  方法:\n", cls];
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(c, &n);
-    for (unsigned int i = 0; i < n && i < 250; i++) {
-        [out appendFormat:@"    - %s\n", sel_getName(method_getName(ms[i]))];
-    }
-    free(ms);
-
-    unsigned int pn = 0;
-    objc_property_t *ps = class_copyPropertyList(c, &pn);
-    [out appendString:@"  属性:\n"];
-    for (unsigned int i = 0; i < pn && i < 250; i++) {
-        [out appendFormat:@"    %s\n", property_getName(ps[i])];
-    }
-    free(ps);
-}
-
-static void VIDumpGeometry(void) {
-    @try {
-        NSMutableString *out = [NSMutableString string];
-        UIScreen *sc = [UIScreen mainScreen];
-
-        [out appendFormat:@"===== VisibleIsland 几何导出 %@ =====\n", [NSDate date]];
-        [out appendFormat:@"device=%@\n", VIDeviceModel() ?: @"?"];
-        [out appendFormat:@"screen bounds=%@ scale=%.2f\n",
-                          NSStringFromCGRect(sc.bounds), (double)sc.scale];
-        [out appendFormat:@"状态: island=%d pos=%d scaleEn=%d scale=%.2f x=%.1f y=%.1f hide=%d\n",
-                          islandEnabled, posEnabled, scaleEnabled,
-                          (double)scale, (double)xPos, (double)yPos, hideEnabled];
-        [out appendFormat:@"自然岛中心: has=%d (%.1f, %.1f)\n",
-                          gHasNatCenter,
-                          (double)gNatIslandCenter.x,
-                          (double)gNatIslandCenter.y];
-        [out appendFormat:@"系统默认岛位置: has=%d %@\n",
-                          gHasDefaultIslandFrame,
-                          gHasDefaultIslandFrame ? NSStringFromCGRect(gLastDefaultIslandFrame) : @"<未取到>"];
-
-        [out appendString:@"\n----- 窗口栈 -----\n"];
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            [out appendFormat:@"%@ level=%.1f f=%@ hid=%d root=%@\n",
-                              NSStringFromClass([w class]),
-                              (double)w.windowLevel,
-                              NSStringFromCGRect(w.frame),
-                              (int)w.hidden,
-                              NSStringFromClass([[w rootViewController] class])];
-        }
-
-        [out appendString:@"\n----- 光圈窗口视图树 -----\n"];
-        UIView *aw = gApertureWindow;
-        if (aw) {
-            [out appendFormat:@"window center=%@ bounds=%@\n",
-                              NSStringFromCGPoint(aw.center),
-                              NSStringFromCGRect(aw.bounds)];
-            VIDumpView(aw, 0, out);
-        } else {
-            [out appendString:@"gApertureWindow 为 nil\n"];
-        }
-
-        [out appendString:@"\n----- 状态栏窗口 -----\n"];
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            NSString *cn = NSStringFromClass([w class]);
-            if ([cn containsString:@"Status"]) VIDumpView(w, 0, out);
-        }
-
-        VIDumpMethods(@"SBSystemApertureController", out);
-        VIDumpMethods(@"SBSystemApertureSettings", out);
-        VIDumpMethods(@"SBSystemApertureWindow", out);
-        VIDumpMethods(@"_SBSystemApertureContainerViewContentView", out);
-        VIDumpMethods(@"_SBSystemApertureMagiciansCurtainView", out);
-
-        NSError *err = nil;
-        BOOL ok = [out writeToFile:VI_DUMP_PATH
-                        atomically:YES
-                          encoding:NSUTF8StringEncoding
-                             error:&err];
-        NSLog(@"[VisibleIsland] 几何导出 %@ -> %@ (%lu 字节)%@",
-              ok ? @"成功" : @"失败", VI_DUMP_PATH, (unsigned long)out.length,
-              err ? [NSString stringWithFormat:@" err=%@", err.localizedDescription] : @"");
-    } @catch (NSException *e) {
-        NSLog(@"[VisibleIsland] 几何导出异常 %@", e.reason);
-    }
-}
-
-static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStringRef name,
-                           const void *object, CFDictionaryRef userInfo) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        VIDumpGeometry();
-    });
-}
-
 // ============================================================
 //  Hooks
 // ============================================================
@@ -383,9 +267,6 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
 
     CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
     CGFloat centeredX = screenW / 2.0 - r.size.width / 2.0;
-
-    NSLog(@"[VisibleIsland] defaultIslandFrame %@ -> x=%.2f (screenW=%.1f) space=%@",
-          NSStringFromCGRect(r), (double)centeredX, (double)screenW, space);
 
     r.origin.x = centeredX;
     return r;
@@ -672,23 +553,12 @@ static void preferencesChanged(void) {
                                     VI_NOTIFY_UPDATE, NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // 注销和几何导出只对 SpringBoard 有意义
+    // 注销只对 SpringBoard 有意义
     if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"]) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         (CFNotificationCallback)respringCallback,
                                         VI_NOTIFY_RESPRING, NULL,
                                         CFNotificationSuspensionBehaviorCoalesce);
 
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        (CFNotificationCallback)VIDumpCallback,
-                                        VI_NOTIFY_DUMP, NULL,
-                                        CFNotificationSuspensionBehaviorCoalesce);
-
-        // 启动 12 秒后静默导一份几何数据，界面上没有入口，不影响使用。
-        // 位置要是还不对，直接拿这个文件就能定位，不用再加按钮重发一版。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            VIDumpGeometry();
-        });
     }
 }
