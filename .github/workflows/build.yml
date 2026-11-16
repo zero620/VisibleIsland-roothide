@@ -82,7 +82,7 @@ jobs:
           tar xzOf /tmp/control.tar.gz ./control 2>/dev/null || tar xzOf /tmp/control.tar.gz control
 
           ls -l "$DEB"
-          OUT="VisibleIsland_2.11.0_roothide_arm64_arm64e.deb"
+          OUT="VisibleIsland_2.11.1_roothide_arm64_arm64e.deb"
           cp "$DEB" "$OUT"
           echo "OUT=$OUT" >> $GITHUB_ENV
           echo OK
