@@ -24,10 +24,13 @@ jobs:
       - name: Install iOS SDKs
         run: |
           set -e
-          curl -fsSL https://github.com/theos/sdks/archive/master.zip -o /tmp/sdks.zip
-          unzip -q /tmp/sdks.zip -d /tmp
+          # 用 tar 而不是 unzip：theos/sdks 里有符号链接，
+          # macOS 的 unzip 建符号链接会报 "symlink error: Permission denied"
+          curl -fsSL https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tar.gz
+          rm -rf /tmp/sdks-master
+          tar -xzf /tmp/sdks.tar.gz -C /tmp
           mkdir -p "$THEOS/sdks"
-          cp -r /tmp/sdks-master/iPhoneOS*.sdk "$THEOS/sdks/"
+          cp -R /tmp/sdks-master/iPhoneOS*.sdk "$THEOS/sdks/"
           ls "$THEOS/sdks"
 
       - name: Install ldid
