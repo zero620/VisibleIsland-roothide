@@ -1,8 +1,8 @@
 Package: com.ethxnn88.visibleisland
 Name: VisibleIsland
-Version: 2.10.1
+Version: 2.11.0
 Architecture: iphoneos-arm64e
-Description: 在老机型上启用并修复灵动岛（汉化版：位置基准修正、隐藏不碰窗口 alpha）
+Description: 在老机型上启用并修复灵动岛（汉化版：2.9.0 基线，移除自动横向偏移与液态玻璃）
 Maintainer: zero
 Author: ethxnn88
 Section: Tweaks
