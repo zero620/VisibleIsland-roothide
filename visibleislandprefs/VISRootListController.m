@@ -77,7 +77,6 @@ static void VIPostUpdate(void) {
 
     NSMutableDictionary *plistDictionary = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
     if (!plistDictionary) {
-        NSLog(@"[VisibleIsland] 读不到 MobileGestalt 缓存: %@", plistPath);
         return NO;
     }
 
@@ -95,11 +94,7 @@ static void VIPostUpdate(void) {
 
     nestedDictionary[@"ArtworkDeviceSubType"] = @(subtype);
 
-    BOOL ok = [plistDictionary writeToFile:plistPath atomically:YES];
-    if (!ok) {
-        NSLog(@"[VisibleIsland] 写入 MobileGestalt 失败，权限不足");
-    }
-    return ok;
+    return [plistDictionary writeToFile:plistPath atomically:YES];
 }
 
 + (void)fixUnsupported {
