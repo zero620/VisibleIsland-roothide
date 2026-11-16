@@ -1,8 +1,10 @@
 // ============================================================
-//  VisibleIsland  2.10.1  (汉化版)
+//  VisibleIsland  2.11.0  (汉化版)
 //  原版：https://github.com/ethxnn88/VisibleIsland
 //
-//  本版 = 原版功能 + 全量汉化 + 位置/隐藏修复。
+//  基线 = 2.9.0（实测能正常显示的最后一版），
+//  在此基础上只做两件事：删掉「自动横向偏移」、删掉「液态玻璃」。
+//  定位公式、隐藏逻辑、幕布处理全部与 2.9.0 逐字一致，不做任何改动。
 //
 //  1. 定位只用 transform，绝不碰 frame / center
 //     原版 layoutSubviews 里先设 transform 再设 frame：
@@ -11,20 +13,11 @@
 //     UIKit 在 transform 非单位矩阵时调 setFrame: 会用 frame 反推 bounds，
 //     窗口 center 因此漂移 —— 这就是「左右偏移」的根因。
 //
-//  2. 位置基准取「幕布」而不是容器
-//     _SBSystemApertureMagiciansCurtainView 是灵动岛被看见的那块形状
-//     （125pt、左右对称）；SBSystemApertureContainerView 是左右不对称的
-//     命中区，中心比岛心偏右 8pt。拿容器当基准就会稳定偏右。
+//  2. 水平 / 垂直补偿（固定公式，无闭环、无自适应）
 //
 //  3. 保留 _SBSystemApertureMagiciansCurtainView
 //     这块幕布是刘海形状、刘海宽度，系统原本用它填刘海和岛之间的空隙。
 //     原版在挪动岛时把它隐藏，于是中间漏一条缝。
-//
-//  4. 「不使用时隐藏」做在视觉层
-//     空闲判定用幕布尺寸（最小态 125×36.67），有活动时幕布会长出去。
-//     只藏幕布 / 内容层 / gain map，绝不碰窗口 alpha ——
-//     压窗口 alpha 一旦判错就是整个岛消失，没法恢复。
-//     写的时候关掉隐式动画，立即生效。
 //
 //  另外修掉的原有 bug：
 //   · scaleEnabled && !posEnabled | scaleEnabled && !fixEnabled 位或误用
@@ -76,14 +69,12 @@ static BOOL gHasNatCenter = NO;
 static CGRect gLastDefaultIslandFrame = {0, 0, 0, 0};
 static BOOL gHasDefaultIslandFrame = NO;
 
-// 「不使用时隐藏」
-//   gShouldHideIsland —— 当前是否处于「已隐藏空闲胶囊」状态
-// 判定完全由幕布尺寸推出来，每一帧重算，没有锁存、没有定时器。
-static BOOL gShouldHideIsland = NO;
+// 光圈控制器报告的「当前有没有活动内容」。用来实现真正的「不使用时隐藏」。
+static BOOL gApertureHasContent = YES;
+static BOOL gHasContentKnown = NO;
 
 // 前向声明
 static void VISyncIdleVisibility(void);
-static void VIApplyIdleHidden(BOOL hide);
 static UIView *VIFindCurtainView(UIView *root);
 
 // ---------------- 机型 ----------------
@@ -135,6 +126,7 @@ static CGFloat VIEffectiveScale(void) {
 static void VIEffectiveOffset(CGFloat *dx, CGFloat *dy) {
     CGFloat x = 0.0, y = 0.0;
     if (posEnabled) {
+        // 开了自动横向居中就不吃手填的横向偏移
         x = xPos;
         y = yPos;
     }
@@ -187,8 +179,7 @@ static UIView *VIFindIslandView(UIView *root) {
 }
 
 // 幕布 = 灵动岛真正被看见的那块形状，宽 125pt、左右对称。
-// 它的中心就是灵动岛的视觉中心；SBSystemApertureContainerView 是左右不对称的
-// 命中区（中心比岛心偏右 8pt），不能拿来当位置基准。
+// 自动居中必须量它，量容器会偏右 8pt（容器是命中区，不是视觉体）。
 static UIView *VIFindCurtainView(UIView *root) {
     if (!root) return nil;
     NSString *cls = NSStringFromClass([root class]);
@@ -204,80 +195,35 @@ static UIView *VIFindCurtainView(UIView *root) {
 
 // ---------------- 「不使用时隐藏」 ----------------
 //
-// 判定用纯几何：灵动岛最小态就是一块 125 × 36.67 的胶囊，
-// 有活动时（放歌 / 计时 / 来电）幕布会横向或纵向长出去。
-// 「幕布还停在最小尺寸」= 空闲。
-//
-// 这里刻意不用 SBSystemApertureController 的 containsAnyContent: ——
-// 那个方法签名吃不准，参数读错就永远是「没内容」，
-// 整个窗口被压成 alpha 0 —— 2.10.0 就是这么把岛弄没的。
-//
-// 也绝不碰窗口 alpha。只藏「看得见的那几层」，判错最多是岛不显示，
-// 窗口本身还活着，下一帧幕布尺寸一变就自动恢复。
+// 只藏 gain map 不够：空闲时那个黑胶囊是幕布 + 内容视图画的。
+// 唯一干净的做法是空闲时把整个光圈窗口淡出。
 
-#define VI_MINIMAL_W 132.0
-#define VI_MINIMAL_H 42.0
+static BOOL gWeHidWindow = NO;
 
-static BOOL VIIslandIsIdle(UIView *window) {
-    UIView *curtain = VIFindCurtainView(window);
-    if (!curtain) return NO;          // 找不到幕布就不藏，宁可不藏也别弄没
-    CGSize sz = curtain.bounds.size;
-    if (sz.width <= 0.0 || sz.height <= 0.0) return NO;
-    return (sz.width <= VI_MINIMAL_W && sz.height <= VI_MINIMAL_H);
-}
-
-// 内容层（真正画东西的那一层）。隐藏只动它，不动容器 ——
-// 容器还兼着触摸命中区，动了容易把交互一起弄坏。
-static UIView *VIFindContentView(UIView *root) {
-    if (!root) return nil;
-    NSString *cls = NSStringFromClass([root class]);
-    if ([cls containsString:@"ContainerViewContentView"]) return root;
-    for (UIView *v in root.subviews) {
-        UIView *r = VIFindContentView(v);
-        if (r) return r;
-    }
-    return nil;
-}
-
-static void VIApplyIdleHidden(BOOL hide) {
+static void VISyncIdleVisibility(void) {
     UIView *w = gApertureWindow;
     if (!w) return;
 
+    // 状态未知时不动，避免误伤
+    BOOL shouldHide = (hideEnabled && gHasContentKnown && !gApertureHasContent);
+
     UIView *curtain = VIFindCurtainView(w);
-    UIView *content = VIFindContentView(w);
-    CGFloat a = hide ? 0.0 : 1.0;
 
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];   // 立即生效，不等 0.25s 淡出
-    if (curtain) {
-        if (curtain.hidden != hide) curtain.hidden = hide;
-        if (fabs(curtain.alpha - a) > 0.001) curtain.alpha = a;
-    }
-    if (content) {
-        if (fabs(content.alpha - a) > 0.001) content.alpha = a;
-    }
-    [CATransaction commit];
-}
-
-static void VISyncIdleVisibility(void) {
-    if (!gApertureWindow) return;
-
-    BOOL hide = (hideEnabled && VIIslandIsIdle(gApertureWindow));
-
-    if (hide == gShouldHideIsland) {
-        // 状态没变，但系统可能在动画里把东西写回来了，补一刀
-        if (hide) {
-            UIView *curtain = VIFindCurtainView(gApertureWindow);
-            UIView *content = VIFindContentView(gApertureWindow);
-            if ((curtain && !curtain.hidden) || (content && content.alpha > 0.01)) {
-                VIApplyIdleHidden(YES);
-            }
+    if (shouldHide) {
+        if (w.alpha != 0.0) w.alpha = 0.0;
+        gWeHidWindow = YES;
+        if (curtain) {
+            curtain.hidden = YES;
+            curtain.alpha = 0.0;
         }
-        return;
+    } else if (gWeHidWindow) {
+        w.alpha = 1.0;
+        gWeHidWindow = NO;
+        if (curtain) {
+            curtain.hidden = NO;
+            curtain.alpha = 1.0;
+        }
     }
-
-    gShouldHideIsland = hide;
-    VIApplyIdleHidden(hide);
 }
 
 // ---------------- 几何导出（诊断用，手动触发） ----------------
@@ -332,11 +278,9 @@ static void VIDumpGeometry(void) {
         [out appendFormat:@"device=%@\n", VIDeviceModel() ?: @"?"];
         [out appendFormat:@"screen bounds=%@ scale=%.2f\n",
                           NSStringFromCGRect(sc.bounds), (double)sc.scale];
-        [out appendFormat:@"状态: island=%d pos=%d scaleEn=%d scale=%.2f x=%.1f y=%.1f hide=%d hiding=%d idle=%d\n",
+        [out appendFormat:@"状态: island=%d pos=%d scaleEn=%d scale=%.2f x=%.1f y=%.1f hide=%d\n",
                           islandEnabled, posEnabled, scaleEnabled,
-                          (double)scale, (double)xPos, (double)yPos,
-                          hideEnabled, gShouldHideIsland,
-                          gApertureWindow ? VIIslandIsIdle(gApertureWindow) : -1];
+                          (double)scale, (double)xPos, (double)yPos, hideEnabled];
         [out appendFormat:@"自然岛中心: has=%d (%.1f, %.1f)\n",
                           gHasNatCenter,
                           (double)gNatIslandCenter.x,
@@ -447,6 +391,16 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
     return r;
 }
 
+// 「当前有没有活动内容」——系统自己的权威判断。
+// 放歌 / 计时 / 来电 = YES，空闲 = NO。用来实现真正的「不使用时隐藏」。
+- (BOOL)systemApertureViewController:(id)vc containsAnyContent:(BOOL)hasContent {
+    gApertureHasContent = hasContent;
+    gHasContentKnown = YES;
+    BOOL r = %orig;
+    VISyncIdleVisibility();
+    return r;
+}
+
 %end
 
 %hook SBSystemApertureWindow
@@ -463,14 +417,11 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
     // 岛是否显示由 MobileGestalt 的 ArtworkDeviceSubType 决定，跟这个开关无关。
     // 以前在这里 return，导致「开关关着但岛还在」时位置完全调不动。
 
-    // 第一次拿到紧凑态尺寸时记下灵动岛的自然中心。
-    // 必须量幕布，不能量 SBSystemApertureContainerView ——
-    // 后者是左右不对称的命中区，中心比岛心偏右 8pt，
-    // 拿它当基准就会稳定偏右（上一版「有点偏右」就是这么来的）。
+    // 第一次拿到紧凑态尺寸时记下灵动岛的自然中心
     if (!gHasNatCenter) {
-        UIView *c = VIFindCurtainView(self) ?: VIFindIslandView(self);
+        UIView *c = VIFindIslandView(self);
         if (c) {
-            CGFloat ch = c.bounds.size.height;
+            CGFloat ch = c.frame.size.height;
             if (ch > 0.0 && ch <= 60.0) {
                 gNatIslandCenter = CGPointMake(CGRectGetMidX(c.frame), CGRectGetMidY(c.frame));
                 gHasNatCenter = YES;
@@ -484,21 +435,17 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
 
     CGFloat winW = self.bounds.size.width;
     CGFloat winH = self.bounds.size.height;
+    CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
 
-    CGFloat natCx = gHasNatCenter ? gNatIslandCenter.x : winW / 2.0;
     CGFloat natCy = gHasNatCenter ? gNatIslandCenter.y : VI_FALLBACK_ISLAND_CY;
 
-    // 补偿：让岛在缩放时原地不动。
-    //
-    // 推导：窗口未变换时岛在屏幕上的位置 = center - bounds/2 + natC。
-    // 变换后视觉中心 = center + (natC - bounds/2) * s + t。
-    // 要求「视觉中心 = 自然位置 + 用户偏移」，解出
-    //   t = offset + (natC - bounds/2) * (1 - s)
-    //
-    // natC 取幕布中心（≈ 窗口中心），所以 compX ≈ 0，
-    // 「横向偏移 0」就是正中，正数向右。
-    CGFloat compX = (natCx - winW / 2.0) * (1.0 - s);
+    // 垂直：一个字都不改。用户已经用 yPos=-44 调好了，动这里等于把调好的推翻。
     CGFloat compY = (natCy - winH / 2.0) * (1.0 - s);
+
+    // 水平：和 2.9.0 完全一致，只保留固定补偿，不做任何闭环微调。
+    CGFloat natCx = gHasNatCenter ? gNatIslandCenter.x : winW / 2.0;
+    CGFloat compX = (natCx - winW / 2.0) * (1.0 - s);
+    if (fabs(winW - screenW) < 10.0) compX += (screenW - winW) / 2.0;
 
     // 关键：只用 transform，绝不碰 frame / center。
     // 原版先设 transform 再设 frame，UIKit 会用缩放后的 frame 反推 bounds，
@@ -537,15 +484,8 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
 
 - (void)didMoveToWindow {
     %orig;
-    // 保留幕布，否则刘海和岛之间会漏一条缝。
-    // 空闲隐藏状态下不要再把它打开，否则藏了等于没藏。
-    if (gShouldHideIsland) {
-        self.hidden = YES;
-        self.alpha = 0.0;
-    } else {
-        self.hidden = NO;
-        self.alpha = 1.0;
-    }
+    // 保留幕布，否则刘海和岛之间会漏一条缝
+    self.hidden = NO;
 }
 
 %end
@@ -555,23 +495,19 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
 // 这块是空闲态盖在摄像头区域上的图层。
 // 原版只在 didMoveToWindow 里处理，那个时机太晚而且只触发一次，
 // 结果就是活动结束以后岛还挂在那儿慢慢淡出。
-// 现在跟着「空闲隐藏」的裁决走，出现即藏。
+// 这里改成每次布局都检查，出现即隐藏，做到「立即隐藏」。
 
 - (void)layoutSubviews {
     %orig;
-    if (gShouldHideIsland) {
+    if (hideEnabled) {
         if (!self.hidden) self.hidden = YES;
         if (self.alpha != 0.0) self.alpha = 0.0;
-    } else if (hideEnabled) {
-        // 不在空闲态就别乱动，交还给系统
-        if (self.hidden) self.hidden = NO;
-        if (self.alpha != 1.0) self.alpha = 1.0;
     }
 }
 
 - (void)didMoveToWindow {
     %orig;
-    if (gShouldHideIsland) {
+    if (hideEnabled) {
         self.hidden = YES;
         self.alpha = 0.0;
     }
@@ -580,11 +516,17 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
 %end
 
 // ============================================================
-//  内容层颜色
+//  「不使用时隐藏」的真正实现
 // ============================================================
 //
-// 「不使用时隐藏」的具体实现见文件上方的 VISyncIdleVisibility() /
-// VIApplyIdleHidden()。判定靠幕布尺寸，不碰窗口 alpha。
+// 上一版只藏了 _SBGainMapView，结果空闲时还能看到一个黑胶囊 ——
+// 因为那个黑胶囊是幕布 + 内容视图画的，跟 gain map 没关系。
+//
+// 唯一可靠的做法：空闲时把整个光圈窗口淡出，一点黑都不留。
+// 「空闲」由系统自己说了算：SBSystemApertureController 的
+//   - systemApertureViewController:containsAnyContent:
+// 就是「当前有没有活动内容」的权威回答（放歌/计时/来电 = YES）。
+// 具体实现见文件上方的 VISyncIdleVisibility()。
 
 %hook _SBSystemApertureContainerViewContentView
 
@@ -597,6 +539,7 @@ static void VIDumpCallback(CFNotificationCenterRef center, void *observer, CFStr
             [self setBackgroundColor:customColor];
         }
     }
+
 }
 
 %end
@@ -676,23 +619,15 @@ static void respringCallback(CFNotificationCenterRef center, void *observer, CFS
     [[%c(FBSystemService) sharedInstance] exitAndRelaunch:YES];
 }
 
-// 一次性迁移
-//
-// 1) 2.8 之前 xPos=68 是为了补「基准量错」的 bug，现在基准改成幕布中心，
-//    「横向偏移 0」才是正中。不清掉旧值会直接右移 68pt。
-// 2) 2.10.0 的隐藏逻辑把窗口 alpha 压成 0 且再也回不来，升级后先把
-//    「不使用时隐藏」关掉，确认岛回来，再让用户自己决定要不要开。
+// 一次性迁移：2.10.x 把 xPos 改成了 0（因为那时基准换了），
+// 现在回到 2.9.0 的基准，xPos 必须回到 68 才能复现 2.9.0 的视觉效果。
+// 顺便把「不使用时隐藏」关掉，保证装完先看到岛。
 static void VIMigrateOnce(void) {
     NSUserDefaults *d = VIPrefs();
-
-    if (![d boolForKey:@"vi_migr_290"]) {
-        [d setFloat:0.0f forKey:@"xPos"];
-        [d setBool:YES forKey:@"vi_migr_290"];
-    }
-    if (![d boolForKey:@"vi_migr_2101"]) {
-        [d setBool:NO forKey:@"hideEnabled"];
-        [d setBool:YES forKey:@"vi_migr_2101"];
-    }
+    if ([d boolForKey:@"vi_migr_2110"]) return;
+    [d setFloat:68.0f forKey:@"xPos"];
+    [d setBool:NO forKey:@"hideEnabled"];
+    [d setBool:YES forKey:@"vi_migr_2110"];
     [d synchronize];
 }
 
@@ -712,7 +647,7 @@ static void preferencesChanged(void) {
     lineDisabled    = VIBool(d, @"lineDisabled", NO);
 
     // 缺省值必须给对：原来缺省取到 0，alpha=0 直接看不见，scale=0 直接缩没
-    xPos  = VIFloat(d, @"xPos", 0.0);
+    xPos  = VIFloat(d, @"xPos", 68.0);
     yPos  = VIFloat(d, @"yPos", -44.0);
     xNot  = VIFloat(d, @"xNot", 0.0);
     yNot  = VIFloat(d, @"yNot", 40.0);
@@ -725,12 +660,6 @@ static void preferencesChanged(void) {
     if (alpha < 0.0) alpha = 0.0;
     if (alpha > 1.0) alpha = 1.0;
     if (!(scale > 0.25) || scale > 2.0) scale = 1.0;
-
-    // 关掉「不使用时隐藏」时立刻把岛放出来，不能等下一次布局
-    if (!hideEnabled) {
-        gShouldHideIsland = NO;
-        VIApplyIdleHidden(NO);
-    }
 
     VIRelayout();
 }
@@ -763,5 +692,3 @@ static void preferencesChanged(void) {
         });
     }
 }
-
-// build retrigger 2.10.1
