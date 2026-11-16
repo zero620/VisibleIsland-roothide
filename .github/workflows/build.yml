@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-14 已于 2026-11-02 退役，写它会静默 cancel
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install roothide Theos
+        run: |
+          set -e
+          export THEOS=$HOME/theos
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+          ls "$THEOS/makefiles" | head
+
+      - name: Install iOS SDKs
+        run: |
+          set -e
+          curl -fsSL https://github.com/theos/sdks/archive/master.zip -o /tmp/sdks.zip
+          unzip -q /tmp/sdks.zip -d /tmp
+          mkdir -p "$THEOS/sdks"
+          cp -r /tmp/sdks-master/iPhoneOS*.sdk "$THEOS/sdks/"
+          ls "$THEOS/sdks"
+
+      - name: Install ldid
+        run: |
+          set -e
+          brew install ldid 2>/dev/null || true
+          if ! command -v ldid >/dev/null 2>&1; then
+            curl -L -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64
+            chmod +x /tmp/ldid
+            sudo mv /tmp/ldid /usr/local/bin/ldid
+          fi
+          ldid -v || true
+
+      - name: Build
+        run: |
+          set -e
+          set -o pipefail
+          make clean >/dev/null 2>&1 || true
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide DISABLE_ROOTLESS_COMPAT_WARNING=1 2>&1 | tee build.log
+
+      - name: Verify + rename
+        run: |
+          set -e
+          DYLIB=$(find .theos -name 'VisibleIsland.dylib' -type f | head -1)
+          echo "DYLIB=$DYLIB"
+          [ -n "$DYLIB" ] || { echo "no dylib"; grep -n 'error:' build.log | head -40; exit 1; }
+
+          ARCHS=$(lipo -archs "$DYLIB")
+          echo "ARCHS=$ARCHS"
+          case "$ARCHS" in *arm64e*) ;; *) echo "FAIL: missing arm64e"; exit 1 ;; esac
+          case "$ARCHS" in *arm64*) ;; *) echo "FAIL: missing arm64"; exit 1 ;; esac
+          lipo -detailed_info "$DYLIB" | grep -E 'architecture|align' || true
+
+          PREFS=$(find .theos -name 'VisibleIslandPrefs' -type f | head -1)
+          echo "PREFS=$PREFS"
+          [ -n "$PREFS" ] || { echo "FAIL: prefs bundle missing"; exit 1; }
+          lipo -archs "$PREFS"
+
+          DEB=$(ls packages/*.deb | head -1)
+          echo "DEB=$DEB"
+          ar t "$DEB"
+
+          echo "=== data paths (must be jbroot-relative, no var/jb) ==="
+          ar p "$DEB" data.tar.lzma > /tmp/data.tar.lzma
+          tar tf /tmp/data.tar.lzma
+
+          echo "=== control ==="
+          ar p "$DEB" control.tar.gz > /tmp/control.tar.gz
+          tar xzOf /tmp/control.tar.gz ./control 2>/dev/null || tar xzOf /tmp/control.tar.gz control
+
+          ls -l "$DEB"
+          OUT="VisibleIsland_2.10.1_roothide_arm64_arm64e.deb"
+          cp "$DEB" "$OUT"
+          echo "OUT=$OUT" >> $GITHUB_ENV
+          echo OK
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VisibleIsland-deb-roothide
+          path: ${{ env.OUT }}
+          if-no-files-found: error
